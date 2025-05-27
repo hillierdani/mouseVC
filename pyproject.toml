@@ -1,0 +1,16 @@
+[project]
+name = "mousevc"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "bbknn>=1.6.0",
+    "matplotlib>=3.10.3",
+    "notebook>=7.4.2",
+    "numpy>=2.2.3",
+    "pandas>=2.2.3",
+    "scanorama>=1.7.4",
+    "scanpy[leiden,louvain]>=1.11.1",
+    "scipy>=1.15.3",
+    "scrublet>=0.2.3",
+]
