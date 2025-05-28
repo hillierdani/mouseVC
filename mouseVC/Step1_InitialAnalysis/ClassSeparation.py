@@ -8,6 +8,7 @@ import scrublet
 import pandas as pd
 import seaborn as sns # For fallback color palettes
 import matplotlib.pyplot as plt
+import os
 
 
 from mouseVC import _cache_path, _load_or_run
@@ -37,12 +38,20 @@ def apply_qc_filters(
         (adata.obs.n_counts < max_counts),
     ]
 
-def import_10x(age_ids=None):
+
+def import_10x(age_ids=None, out_path=None):
     age_ids = age_ids or ['P8','P14','P17','P21','P28','P38']
     cache_file = _cache_path('preHVG', *age_ids)
-    return _load_or_run(cache_file, lambda: _compute_import_10x(age_ids))
+    adata = _load_or_run(cache_file, lambda: _compute_import_10x(age_ids, out_path))
 
-def _compute_import_10x(age_ids=None):
+    # always write to requested out_path
+    if out_path is None:
+        out_path = 'PooledMVC_preHVG.h5ad'
+    if not os.path.exists(out_path):
+        adata.write_h5ad(out_path)
+
+
+def _compute_import_10x(age_ids=None, out_path=None):
     """
     Read raw 10x matrices per age, concatenate without filtering,
     compute QC metrics and plot before filtering,
@@ -51,6 +60,7 @@ def _compute_import_10x(age_ids=None):
     """
     if age_ids is None:
         age_ids = ['P8', 'P14', 'P17', 'P21', 'P28', 'P38']
+
     base = Path(__file__).parent.parent / 'ProcessedData' / 'Raw_Counts_Samples'
     default_suffs = ['_nr_1_a', '_nr_1_b', '_nr_2_a', '_nr_2_b']
     special = {'P38': ['_nr_1_a', '_nr_2_a', '_nr_2_b']}
@@ -59,21 +69,31 @@ def _compute_import_10x(age_ids=None):
     raw_age_adatas = []
     for age in age_ids:
         suffs = special.get(age, default_suffs)
-        reps = [
-            sc.read_10x_mtx(
-                base / f"{age}{s}" / "filtered_feature_bc_matrix",
-                var_names='gene_symbols',
-                cache=True
-            )
-            for s in suffs
-        ]
-        labels = [f"{age}_{s.split('_nr_')[-1].replace('_', '')}" for s in suffs]
-        raw_age_adatas.append(
-            anndata.concat(reps, label='batch', keys=labels)
-        )
+        # concatenate raw replicates per age
+        all_reps = []  # Collect all replicates across all ages
 
-    # full raw object
-    adata_raw = raw_age_adatas[0].concatenate(*raw_age_adatas[1:], batch_categories=age_ids)
+        for age in age_ids:
+            suffs = special.get(age, default_suffs)
+
+            for s in suffs:
+                rep = sc.read_10x_mtx(
+                    base / f"{age}{s}" / "filtered_feature_bc_matrix",
+                    var_names='gene_symbols',
+                    cache=True
+                )
+
+                # FIX 4: Ensure unique cell names by prefixing
+                replicate_id = s.split('_nr_')[-1].replace('_', '')
+                rep.obs_names = [f"{age}_{replicate_id}_{bc}" for bc in rep.obs_names]
+
+                # Add batch information without letting concat modify barcodes
+                rep.obs['batch'] = age
+                rep.obs['replicate'] = f"{age}_{replicate_id}"
+
+                all_reps.append(rep)
+
+        # Single concatenation step that preserves barcode names
+        adata_raw = anndata.concat(all_reps, merge='same')
 
     # compute QC metrics on raw
     mito_mask = adata_raw.var_names.str.startswith('mt-')
@@ -101,7 +121,6 @@ def _compute_import_10x(age_ids=None):
     sc.pp.log1p(adata)
     adata.raw = adata
 
-    adata.write_h5ad('PooledMVC_preHVG.h5ad')
     return adata
 
 
@@ -129,8 +148,8 @@ def _compute_cluster(
     return adata
 
 def cluster(
-    path_to_pooled_pre_HVG: str,
-    output_path: str = 'PooledMVC_clusteredPCA.h5ad',
+    path_to_pooled_pre_HVG: str | Path,
+    output_path: str | Path = 'PooledMVC_clusteredPCA.h5ad',
     hvg_params: dict     = None,
     pca_params: dict     = None,
     neigh_params: dict   = None,
@@ -264,7 +283,7 @@ def process_replicate(
     logger.debug("Processed %s, %d cells remain", matrix_path.name, ad.n_obs)
     return ad
 
-def doublet_detection(timepoints: List[str] = ['P8', 'P14', 'P17', 'P21', 'P28', 'P38']):
+def doublet_detection(timepoints: List[str] = ['P8', 'P14', 'P17', 'P21', 'P28', 'P38'], out_path=None):
     """
     Iterate over timepoints and replicates, merge per-age and then all ages.
     """
@@ -273,18 +292,25 @@ def doublet_detection(timepoints: List[str] = ['P8', 'P14', 'P17', 'P21', 'P28',
     special_suffs: Dict[str, List[str]] = {'P38': ['_nr_1_a', '_nr_2_a', '_nr_2_b']}
 
     age_adatas: List[AnnData] = []
-    for tp in timepoints:
-        suffixes = special_suffs.get(tp, default_suffs)
-        reps = [
-            process_replicate(base_path / "Raw_Counts_samples"/f"{tp}{s}" / "filtered_feature_bc_matrix")
-            for s in suffixes
-        ]
-        batch_labels = [f"{tp}_{s.split('_nr_')[1].replace('_','')}" for s in suffixes]
+    for age in timepoints:
+        suffixes = special_suffs.get(age, default_suffs)
+        reps = []
+
+        for s in suffixes:
+            rep = process_replicate(base_path / "Raw_Counts_samples" / f"{age}{s}" / "filtered_feature_bc_matrix")
+
+            # FIX 4: ADD THIS BLOCK - Ensure unique cell names by prefixing
+            replicate_id = s.split('_nr_')[1].replace('_', '')
+            rep.obs_names = [f"{age}_{replicate_id}_{bc}" for bc in rep.obs_names]
+
+            reps.append(rep)
+
+        batch_labels = [f"{age}_{s.split('_nr_')[1].replace('_', '')}" for s in suffixes]
         age_adatas.append(
             anndata.concat(reps, label='batch', keys=batch_labels)
         )
     adata = anndata.concat(age_adatas, label='batch', keys=timepoints)
-    adata.write_h5ad('PooledMVC_dubs.h5ad')
+    adata.write_h5ad(out_path or 'PooledMVC_dubs.h5ad')
     return
 
 def annotate_doublets(
@@ -304,8 +330,18 @@ def annotate_doublets(
     dubs = sc.read_h5ad(dubs_path)
     dubs.obs_names_make_unique()             # ensure unique barcodes
 
+    # DEBUG: Print barcode info
+    print(f"Clustered data: {adata.n_obs} cells")
+    print(f"Doublets data: {dubs.n_obs} cells")
+    print(f"Sample clustered barcodes: {list(adata.obs_names[:5])}")
+    print(f"Sample doublet barcodes: {list(dubs.obs_names[:5])}")
+
     # intersect cell barcodes and subset
     common = adata.obs_names.intersection(dubs.obs_names)
+    print(f"Common cells found: {len(common)}")
+    if len(common) == 0:
+        raise ValueError("No common cells found between clustered and doublets data!")
+
     adata = adata[common].copy()
 
     # add doublet annotations
@@ -952,9 +988,9 @@ def split_by_class_and_age(
                 age_obj.X = age_obj.raw.X.copy()
 
             # Save age-specific object
-            age_path = output_dir / f"{age}_{class_name.lower()}_raw.h5ad"
+            age_path = output_dir / f"{class_name.lower()}_{age}.h5ad"
             age_obj.write_h5ad(age_path)
-            age_paths[f"{age}_{class_name}"] = age_path
+            age_paths[f"{class_name}_{age}"] = age_path
 
             if verbose:
                 print(f"  Saved {age} {class_name} object with {age_obj.n_obs} cells")
@@ -963,43 +999,60 @@ def split_by_class_and_age(
     return {**class_paths, **age_paths}
 
 
-if __name__ == '__main__':
-    from pathlib import Path
-
+def main(age=None):
     # 1. Import and filter 10x for one timepoint
-    datasets = ['P28']
-    print(f"Analyzing: {datasets}")
-    adata_pre = import_10x(datasets)
+    if age is None:
+        age = ['P8', 'P28']
+    age = [a1.upper() for a1 in age]
+    # create a single tag (e.g. "P8" or "P8_P14")
+    age_tag = '_'.join(age)
+    
+    # create data/<AGE> folder
+    data_dir = Path('data') / age_tag
+    data_dir.mkdir(parents=True, exist_ok=True)
+    fig_dir = Path('figures') / age_tag
+    fig_dir.mkdir(parents=True, exist_ok=True)                  # ensure figure dir exists
+    sc.settings.figdir = fig_dir                                # direct scanpy plots here
+
+    print(f"Analyzing: {age_tag}")
+    pre_hvg_path = data_dir / f'PooledMVC_preHVG_{age_tag}.h5ad'
+    import_10x(age, pre_hvg_path)
 
     # 2. Cluster and save to `PooledMVC_clusteredPCA.h5ad`
+    clustered_path = data_dir / f'PooledMVC_clusteredPCA_{age_tag}.h5ad'
     cluster(
-        path_to_pooled_pre_HVG='PooledMVC_preHVG.h5ad',
-        output_path='PooledMVC_clusteredPCA.h5ad'
+        path_to_pooled_pre_HVG=pre_hvg_path,
+        output_path=clustered_path
     )
 
     # 3. Post-clustering analysis and dotplots
     post_clustering_analysis(
-        input_h5ad='PooledMVC_preHVG.h5ad',
-        output_h5ad='PooledMVC_clusteredPCA.h5ad'
+        input_h5ad=pre_hvg_path,
+        output_h5ad=clustered_path
     )
 
     # 4. Doublet detection and annotation
-    doublet_detection(datasets)
+    dubs_path = data_dir / f'PooledMVC_dubs_{age_tag}.h5ad'
+    doublet_detection(age, dubs_path)
+    dubs_clustered_path = data_dir / f'PooledMVC_clusteredPCA_dubs_{age_tag}.h5ad'
     annotate_doublets(
-        clustered_path=Path('PooledMVC_clusteredPCA.h5ad'),
-        dubs_path=Path('PooledMVC_dubs.h5ad'),
-        output_path=Path('PooledMVC_clusteredPCA_dubs.h5ad')
+        clustered_path=clustered_path,
+        dubs_path=dubs_path,
+        output_path=dubs_clustered_path
     )
 
     # 5. Plot doublet score distribution on the merged AnnData
     plot_doublet_score_distribution(
-        input_h5ad=Path('PooledMVC_clusteredPCA_dubs.h5ad')
+        input_h5ad=dubs_clustered_path,
+        output_score_pdf=fig_dir / f'DoubletScores_{age_tag}.pdf',     # save under fig_dir
+        output_percent_pdf=fig_dir / f'DoubletPercents_{age_tag}.pdf'
     )
 
     # 6. Rename clusters, assign broad classes, UMAPs & dotplot
+    acp_out = data_dir / f'PooledMVC_clusteredPCA_dubs_classes_{age_tag}.h5ad'
     annotate_clusters_and_plot(
-        input_path=Path('PooledMVC_clusteredPCA_dubs.h5ad'),
-        output_path=Path('PooledMVC_clusteredPCA_dubs_classes.h5ad'),
+        input_path=dubs_clustered_path,
+        output_path=acp_out,
         cluster_map=cluster_dict,
         class_broad_map=class_broad_map,
         leiden_markers=leiden_markers
@@ -1007,28 +1060,29 @@ if __name__ == '__main__':
 
     # 7. Assign subclasses and plot their doublet distributions
     assign_subclasses(
-        input_h5ad=Path('PooledMVC_clusteredPCA_dubs_classes.h5ad'),
+        input_h5ad=acp_out,
         subclass_map=subclass_map,
-        output_h5ad=Path('PooledMVC_clusteredPCA_dubs_classes.h5ad')
+        output_h5ad=acp_out
     )
     plot_subclass_doublet_distribution(
-        input_h5ad=Path('PooledMVC_clusteredPCA_dubs_classes.h5ad')
+        input_h5ad=acp_out
     )
 
+    clean_out = data_dir / f'PooledMVC_clusteredPCA_dubs_classes_clean_{age_tag}.h5ad'
     remove_doublets_and_ambiguous(
-        input_h5ad=Path('PooledMVC_clusteredPCA_dubs_classes.h5ad'),
-        output_h5ad=Path('PooledMVC_clusteredPCA_dubs_classes_clean.h5ad')
+        input_h5ad=acp_out,
+        output_h5ad=clean_out
     )
 
     plot_cluster_size_distribution(
-        input_h5ad=Path('PooledMVC_clusteredPCA_dubs_classes.h5ad'),
-        output_pdf=Path('figures/cluster_fraction.pdf'),
+        input_h5ad=acp_out,
+        output_pdf=fig_dir / f'cluster_fraction_{age_tag}.pdf',         # replaced data_dir/figures
         figsize=(20, 7)
     )
     plot_age_class_distributions(
-        input_h5ad=Path('PooledMVC_clusteredPCA_dubs_classes.h5ad'),
-        output_class_pdf=Path('figures/age_fraction_class.pdf'),
-        output_age_pdf=Path('figures/age_fraction_cluster.pdf')
+        input_h5ad=acp_out,
+        output_class_pdf=fig_dir / f'age_fraction_class_{age_tag}.pdf',
+        output_age_pdf=fig_dir / f'age_fraction_cluster_{age_tag}.pdf'
     )
     if 0:
         plot_sample_class_distribution(
@@ -1037,10 +1091,20 @@ if __name__ == '__main__':
             output_pdf=Path('figures/sample_dist_Fig1.pdf')
         )
     plot_age_distribution_by_cluster_reversed(
-        input_h5ad=Path('PooledMVC_clusteredPCA_dubs_classes.h5ad'),
-        output_pdf=Path('figures/age_fraction_by_cluster.pdf')
+        input_h5ad=acp_out,
+        output_pdf=fig_dir / f'age_fraction_by_cluster_{age_tag}.pdf'
     )
+
     result_paths = split_by_class_and_age(
-        input_h5ad=Path('PooledMVC_clusteredPCA_dubs_classes_clean.h5ad'),
-        output_dir=Path('data/split_objects')
+        input_h5ad=clean_out,
+        output_dir=data_dir / 'split_objects'
     )
+
+if __name__ == '__main__':
+    import sys
+    import fire
+
+    if len(sys.argv) == 1:
+        main()
+    else:
+        fire.Fire()

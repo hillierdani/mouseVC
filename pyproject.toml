@@ -5,6 +5,7 @@ description = "Add your description here"
 requires-python = ">=3.11"
 dependencies = [
     "bbknn>=1.6.0",
+    "fire>=0.7.0",
     "matplotlib>=3.10.3",
     "notebook>=7.4.2",
     "numpy>=2.2.3",
