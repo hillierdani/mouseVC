@@ -1,1110 +1,490 @@
 import logging
 import numpy as np
-import scanpy as sc
+import scarf
 from pathlib import Path
-from anndata import AnnData
-import anndata
-import scrublet
 import pandas as pd
-import seaborn as sns # For fallback color palettes
+import seaborn as sns
 import matplotlib.pyplot as plt
 import os
-
-
+from typing import Dict, List, Tuple, Optional
 from mouseVC import _cache_path, _load_or_run
 
 logger = logging.getLogger(__name__)
 from mouseVC.Step1_InitialAnalysis.definitions import cluster_dict, class_broad_map, leiden_markers, subclass_map
 
-def apply_qc_filters(
-    adata: AnnData,
-    min_genes: int = 700,
-    min_cells: int = 8,
-    percent_mito_thresh: float = 0.01,
-    max_genes: int = 6500,
-    max_counts: int = 40000
-) -> AnnData:
-    sc.pp.filter_cells(adata, min_genes=min_genes)
-    sc.pp.filter_genes(adata, min_cells=min_cells)
-    mito_mask = adata.var_names.str.startswith('mt-')
-    adata.obs['percent_mito'] = (
-        np.sum(adata[:, mito_mask].X, axis=1).A1 /
-        np.sum(adata.X, axis=1).A1
-    )
-    adata.obs['n_counts'] = adata.X.sum(axis=1).A1
-    return adata[
-        (adata.obs.percent_mito < percent_mito_thresh) &
-        (adata.obs.n_genes < max_genes) &
-        (adata.obs.n_counts < max_counts),
-    ]
+
+def apply_qc_filters_scarf(
+		ds: scarf.DataStore,
+		min_genes: int = 700,
+		min_cells: int = 8,
+		percent_mito_thresh: float = 0.01,
+		max_genes: int = 6500,
+		max_counts: int = 40000
+) -> scarf.DataStore:
+	"""Apply QC filters using Scarf's built-in methods"""
+
+	# Filter cells and features using Scarf's efficient methods
+	ds.filter_cells(
+		min_features=min_genes,
+		max_features=max_genes,
+		max_mito_percent=percent_mito_thresh * 100,
+		max_counts=max_counts
+	)
+
+	ds.filter_features(min_cells=min_cells)
+
+	return ds
 
 
-def import_10x(age_ids=None, out_path=None):
-    age_ids = age_ids or ['P8','P14','P17','P21','P28','P38']
-    cache_file = _cache_path('preHVG', *age_ids)
-    adata = _load_or_run(cache_file, lambda: _compute_import_10x(age_ids, out_path))
+def import_10x_scarf(
+		age_ids: List[str] = None,
+		output_path: str = 'data/scarf_preHVG.zarr'
+) -> scarf.DataStore:
+	"""Simplified 10x import using AnnData intermediate step"""
 
-    # always write to requested out_path
-    if out_path is None:
-        out_path = 'PooledMVC_preHVG.h5ad'
-    if not os.path.exists(out_path):
-        adata.write_h5ad(out_path)
+	if age_ids is None:
+		age_ids = ['P8', 'P14', 'P17', 'P21', 'P28', 'P38']
 
+	output_path = Path(output_path)
+	output_path.parent.mkdir(parents=True, exist_ok=True)
 
-def _compute_import_10x(age_ids=None, out_path=None):
-    """
-    Read raw 10x matrices per age, concatenate without filtering,
-    compute QC metrics and plot before filtering,
-    apply QC filters, plot after filtering,
-    normalize, log-transform, set raw, and save to `PooledMVC_preHVG.h5ad`.
-    """
-    if age_ids is None:
-        age_ids = ['P8', 'P14', 'P17', 'P21', 'P28', 'P38']
+	if output_path.exists():
+		return scarf.DataStore(str(output_path), nthreads=4)
 
-    base = Path(__file__).parent.parent / 'ProcessedData' / 'Raw_Counts_Samples'
-    default_suffs = ['_nr_1_a', '_nr_1_b', '_nr_2_a', '_nr_2_b']
-    special = {'P38': ['_nr_1_a', '_nr_2_a', '_nr_2_b']}
+	# Step 1: Use your existing AnnData concatenation logic
+	# (copy from your working _compute_import_10x function)
+	base = Path(__file__).parent.parent / 'ProcessedData' / 'Raw_Counts_Samples'
+	default_suffs = ['_nr_1_a', '_nr_1_b', '_nr_2_a', '_nr_2_b']
+	special = {'P38': ['_nr_1_a', '_nr_2_a', '_nr_2_b']}
 
-    # concatenate raw replicates per age
-    raw_age_adatas = []
-    for age in age_ids:
-        suffs = special.get(age, default_suffs)
-        # concatenate raw replicates per age
-        all_reps = []  # Collect all replicates across all ages
+	from scipy import sparse
+	import scanpy as sc
 
-        for age in age_ids:
-            suffs = special.get(age, default_suffs)
+	all_adatas = []
 
-            for s in suffs:
-                rep = sc.read_10x_mtx(
-                    base / f"{age}{s}" / "filtered_feature_bc_matrix",
-                    var_names='gene_symbols',
-                    cache=True
-                )
+	for age in age_ids:
+		suffs = special.get(age, default_suffs)
+		age_reps = []
 
-                # FIX 4: Ensure unique cell names by prefixing
-                replicate_id = s.split('_nr_')[-1].replace('_', '')
-                rep.obs_names = [f"{age}_{replicate_id}_{bc}" for bc in rep.obs_names]
+		for s in suffs:
+			adata_temp = sc.read_10x_mtx(
+				base / f"{age}{s}" / "filtered_feature_bc_matrix",
+				var_names='gene_symbols',
+				cache=True
+			)
+			adata_temp.var_names_make_unique()
 
-                # Add batch information without letting concat modify barcodes
-                rep.obs['batch'] = age
-                rep.obs['replicate'] = f"{age}_{replicate_id}"
+			# Create unique cell names
+			replicate_id = s.split('_nr_')[-1].replace('_', '')
+			adata_temp.obs_names = [f"{age}_{replicate_id}_{bc}" for bc in adata_temp.obs_names]
 
-                all_reps.append(rep)
+			# Add metadata
+			adata_temp.obs['batch'] = age
+			adata_temp.obs['replicate'] = f"{age}_{replicate_id}"
 
-        # Single concatenation step that preserves barcode names
-        adata_raw = anndata.concat(all_reps, merge='same')
+			age_reps.append(adata_temp)
 
-    # compute QC metrics on raw
-    mito_mask = adata_raw.var_names.str.startswith('mt-')
-    adata_raw.obs['percent_mito'] = (
-        np.sum(adata_raw[:, mito_mask].X, axis=1).A1 /
-        np.sum(adata_raw.X, axis=1).A1
-    )
-    adata_raw.obs['n_counts'] = adata_raw.X.sum(axis=1).A1
-    adata_raw.obs['n_genes'] = (adata_raw.X > 0).sum(axis=1).A1
+		# Concatenate replicates for this age
+		if len(age_reps) > 1:
+			age_adata = sc.concat(age_reps, merge='same')
+		else:
+			age_adata = age_reps[0]
 
-    # before QC plots
-    sc.pl.violin(adata_raw, ['n_genes', 'n_counts', 'percent_mito'],
-                 jitter=0.4, multi_panel=True)
-    sc.pl.scatter(adata_raw, x='n_counts', y='percent_mito')
-    sc.pl.scatter(adata_raw, x='n_counts', y='n_genes')
+		all_adatas.append(age_adata)
 
-    # apply QC filters and plot after
-    adata = apply_qc_filters(adata_raw.copy())
-    sc.pl.violin(adata, ['n_genes', 'n_counts', 'percent_mito'],
-                 jitter=0.4, multi_panel=True)
-    sc.pl.scatter(adata, x='n_counts', y='percent_mito')
+	# Concatenate all ages
+	final_adata = sc.concat(all_adatas, merge='same')
 
-    # normalize, log-transform, set raw
-    sc.pp.normalize_total(adata, target_sum=1e4)
-    sc.pp.log1p(adata)
-    adata.raw = adata
+	# Step 2: Save as h5ad temporarily
+	temp_h5ad = output_path.with_suffix('.h5ad')
+	final_adata.write_h5ad(temp_h5ad)
 
-    return adata
+	# Step 3: Convert h5ad to Scarf using built-in converter
+	reader = scarf.H5adReader(str(temp_h5ad))
+	writer = scarf.H5adToZarr(
+		reader,
+		zarr_loc=str(output_path),
+		chunk_size=(2000, 1000)
+	)
+	writer.dump()
+
+	# Step 4: Clean up temporary file and create DataStore
+	temp_h5ad.unlink()
+	ds = scarf.DataStore(str(output_path), nthreads=4)
+
+	# Apply QC filters
+	ds = apply_qc_filters_scarf(ds)
+
+	logger.info(f"Imported {ds.cells.N} cells with {ds.RNA.feats.N} features")
+	return ds
 
 
-def _compute_cluster(
-    path_to_pooled_pre_HVG: str,
-    hvg_params: dict,
-    pca_params: dict,
-    neigh_params: dict,
-    leiden_params: dict,
-    umap_params: dict
-):
-    adata = sc.read_h5ad(path_to_pooled_pre_HVG)
-    sc.pp.highly_variable_genes(adata, **hvg_params)
-    sc.pp.scale(adata, max_value=10)
-    sc.tl.pca(adata, **pca_params)
-    sc.pp.neighbors(adata, **neigh_params)
-    sc.tl.leiden(
-        adata,
-        flavor='igraph',
-        directed=False,
-        n_iterations=2,
-        **leiden_params
-    )
-    sc.tl.umap(adata, **umap_params)
-    return adata
+def cluster_scarf(
+		ds: scarf.DataStore,
+		n_hvgs: int = 2000,
+		n_pcs: int = 40,
+		k_neighbors: int = 25,
+		leiden_resolution: float = 0.5
+) -> scarf.DataStore:
+	"""Memory-efficient clustering using Scarf"""
 
-def cluster(
-    path_to_pooled_pre_HVG: str | Path,
-    output_path: str | Path = 'PooledMVC_clusteredPCA.h5ad',
-    hvg_params: dict     = None,
-    pca_params: dict     = None,
-    neigh_params: dict   = None,
-    leiden_params: dict  = None,
-    umap_params: dict    = None
-):
-    """
-    Cached Leiden‐UMAP pipeline.  Uses the hashed combination of
-    path_to_pooled_pre_HVG and all param dicts to name its cache file.
-    """
-    hvg_params   = hvg_params   or {'min_mean':0.0125,'max_mean':3,'min_disp':0.5}
-    pca_params   = pca_params   or {'svd_solver':'arpack'}
-    neigh_params = neigh_params or {'n_neighbors':25,'n_pcs':40}
-    leiden_params= leiden_params or {}
-    umap_params  = umap_params  or {}
+	# HVG selection
+	ds.mark_hvgs(
+		min_cells=8,  # Minimum cells expressing the gene
+		top_n=n_hvgs,  # Number of HVGs to select
+		min_mean=0.0125,  # Minimum mean expression threshold
+		max_mean=3,  # Maximum mean expression threshold
+		max_var=6  # Maximum variance threshold
+	)
 
-    key = (
-        path_to_pooled_pre_HVG,
-        frozenset(hvg_params.items()),
-        frozenset(pca_params.items()),
-        frozenset(neigh_params.items()),
-        frozenset(leiden_params.items()),
-        frozenset(umap_params.items())
-    )
-    cache_file = _cache_path('clustered', *key)
-    adata = _load_or_run(cache_file,
-                         lambda: _compute_cluster(
-                             path_to_pooled_pre_HVG,
-                             hvg_params, pca_params,
-                             neigh_params, leiden_params,
-                             umap_params
-                         ))
-    adata.write_h5ad(output_path)
-    return adata
+	# Create neighborhood graph (includes normalization, PCA)
+	ds.make_graph(
+		feat_key='hvgs',
+		dims=n_pcs,
+		k=k_neighbors,
+		n_centroids=100
+	)
 
-from typing import Dict, List
+	# Leiden clustering
+	ds.run_leiden_clustering(
+		resolution=leiden_resolution,
+		label='leiden_cluster'
+	)
 
-def post_clustering_analysis(
-    input_h5ad: Path = Path('PooledMVC_preHVG.h5ad'),
-    output_h5ad: Path = Path('PooledMVC_clusteredPCA.h5ad'),
-    hvg_params: Dict = None,
-    pca_params: Dict = None,
-    neigh_params: Dict = None,
-    leiden_params: Dict = None,
-    umap_params: Dict = None,
-    dotplot_groups: Dict[str, List[str]] = None
+	# UMAP embedding
+	ds.run_umap(
+		feat_key='hvgs',
+		n_epochs=200
+	)
+
+	logger.info(f"Clustering complete with {len(set(ds.cells.fetch('RNA_leiden_cluster')))} clusters")
+	return ds
+
+
+def doublet_detection_scarf(
+		ds: scarf.DataStore,
+		expected_doublet_rate: float = 0.06
+) -> scarf.DataStore:
+	"""Memory-efficient doublet detection using Scarf"""
+
+	# Scarf has built-in doublet detection
+	ds.mark_doublets(
+		cluster_key='RNA_leiden_cluster',
+		expected_doublet_rate=expected_doublet_rate
+	)
+
+	logger.info("Doublet detection complete")
+	return ds
+
+
+def annotate_clusters_scarf(
+		ds: scarf.DataStore,
+		cluster_map: Dict[int, str],
+		class_broad_map: Dict[str, str]
+) -> scarf.DataStore:
+	"""Annotate clusters with names and broad classes using Scarf"""
+
+	# Get leiden cluster assignments
+	leiden_clusters = ds.cells.fetch('RNA_leiden_cluster')
+
+	# Map to named clusters
+	named_clusters = [cluster_map.get(int(cluster), f"Unknown_{cluster}")
+					  for cluster in leiden_clusters]
+	ds.cells.insert('cluster', named_clusters)
+
+	# Map to broad classes
+	broad_classes = [class_broad_map.get(str(cluster), 'Excitatory')
+					 for cluster in leiden_clusters]
+	ds.cells.insert('Class_broad', broad_classes)
+
+	logger.info("Cluster annotation complete")
+	return ds
+
+
+def plot_comprehensive_analysis_scarf(
+		ds: scarf.DataStore,
+		output_dir: Path,
+		leiden_markers: List[str] = None
 ) -> None:
-    """
-    Load pre-HVG AnnData, run HVG → PCA → neighbors → Leiden → UMAP,
-    save clustered object, then generate dotplots for provided marker sets.
-    """
-    sc.settings.verbosity = 3
-    adata = sc.read_h5ad(input_h5ad)
+	"""Generate comprehensive plots using Scarf's plotting functions"""
 
-    # default parameters
-    hvg_params     = hvg_params     or {'min_mean':0.0125, 'max_mean':3, 'min_disp':0.5}
-    pca_params     = pca_params     or {'svd_solver':'arpack'}
-    neigh_params   = neigh_params   or {'n_neighbors':25, 'n_pcs':40}
-    leiden_params  = leiden_params  or {}
-    umap_params    = umap_params    or {}
+	output_dir.mkdir(parents=True, exist_ok=True)
 
-    # clustering pipeline
-    sc.pp.highly_variable_genes(adata, **hvg_params)
-    sc.pp.scale(adata, max_value=10)
-    sc.tl.pca(adata, **pca_params)
-    sc.pp.neighbors(adata, **neigh_params)
-    sc.tl.leiden(
-        adata,
-        flavor='igraph',
-        directed=False,
-        n_iterations=2,
-        **leiden_params
-    )
-    sc.tl.umap(adata, **umap_params)
+	# Basic UMAP plots
+	ds.plot_layout(
+		layout_key='RNA_UMAP',
+		color_by='RNA_leiden_cluster',
+		save_as=str(output_dir / 'umap_leiden_clusters.pdf')
+	)
 
-    adata.write_h5ad(output_h5ad)
+	ds.plot_layout(
+		layout_key='RNA_UMAP',
+		color_by='Class_broad',
+		save_as=str(output_dir / 'umap_broad_classes.pdf')
+	)
 
-    # dotplot marker sets
-    dotplot_groups = dotplot_groups or {
-        'non_neuron': [
-            'Aqp4','Aldoc','Aldh1l1','S100b','Pdgfra','Enpp6',
-            'Dcn','Bgn','Aox3','Osr1','Lum','Col1a1',
-            'Kcnj8','Abcc9','Art3','Acta2','Cspg4','Angpt1',
-            'Des','Pdgfb','Nos3','Pecam1','Tek','Mrc1',
-            'Lyve1','Cd163','Cd4','Lyz2','Tmem119','Ctss','Cx3cr1'
-        ],
-        'gluta': [
-            'Slc17a7','Snap25','Cux2','Rorb','Mdga1','Deptor',
-            'Rbp4','Batf3','Osr1','Cdh9','Bcl6','Fam84b','Foxp2',
-            'Slc17a8','Trhr','Sla2','Rapgef3','Ctgf','Nxph4','Inpp4b'
-        ],
-        'gaba': [
-            'Gad1','Gad2','Sst','Cpne5','Tac1','Pvalb','Vip',
-            'Pax6','Tmem182','Plch2','Dock5','Krt73','Lamp5'
-        ]
-    }
+	ds.plot_layout(
+		layout_key='RNA_UMAP',
+		color_by='cluster',
+		save_as=str(output_dir / 'umap_named_clusters.pdf')
+	)
 
-    for name, genes in dotplot_groups.items():
-        present_genes = [g for g in genes if g in adata.var_names]
-        missing_genes = [g for g in genes if g not in adata.var_names]
-        print(f"Genes not present: {missing_genes}")
-        sc.pl.dotplot(
-            adata, present_genes,
-            groupby='leiden',
-            dendrogram=True,
-            save=f'_{name}_pca.pdf'
-        )
+	ds.plot_layout(
+		layout_key='RNA_UMAP',
+		color_by='batch',
+		save_as=str(output_dir / 'umap_batch.pdf')
+	)
+
+	# Doublet visualization
+	if 'is_doublet' in ds.cells.columns:
+		ds.plot_layout(
+			layout_key='RNA_UMAP',
+			color_by='is_doublet',
+			save_as=str(output_dir / 'umap_doublets.pdf')
+		)
+
+	# Cluster relationships
+	ds.plot_cluster_tree(
+		cluster_key='RNA_paris_cluster',
+		save_as=str(output_dir / 'cluster_dendrogram.pdf')
+	)
+
+	# Feature plots for markers
+	if leiden_markers:
+		for i, marker in enumerate(leiden_markers[:10]):  # Top 10 markers
+			if marker in ds.RNA.feats.fetch_all('names'):
+				ds.plot_layout(
+					layout_key='RNA_UMAP',
+					color_by=marker,
+					save_as=str(output_dir / f'umap_marker_{marker}.pdf')
+				)
+
+	logger.info(f"Plots saved to {output_dir}")
 
 
-def process_replicate(
-    matrix_path: Path,
-    min_genes: int = 700,
-    min_cells: int = 8,
-    percent_mito_thresh: float = 0.01,
-    max_genes: int = 6500,
-    max_counts: int = 40000,
-    expected_doublet_rate: float = 0.06
-) -> AnnData:
-    """
-    Load a 10x matrix, filter cells/genes, compute QC metrics,
-    run Scrublet and annotate doublets.
-    """
-    ad = sc.read_10x_mtx(str(matrix_path), var_names='gene_symbols', cache=True)
-    ad = apply_qc_filters(ad, min_genes, min_cells, percent_mito_thresh, max_genes, max_counts)
-
-    scrub = scrublet.Scrublet(ad.X, expected_doublet_rate=expected_doublet_rate)
-    scrub.scrub_doublets(min_cells=min_cells, min_gene_variability_pctl=85, n_prin_comps=40)
-    ad.obs['Doublet'] = scrub.predicted_doublets_
-    ad.obs['Doublet Score'] = scrub.doublet_scores_obs_
-
-    logger.debug("Processed %s, %d cells remain", matrix_path.name, ad.n_obs)
-    return ad
-
-def doublet_detection(timepoints: List[str] = ['P8', 'P14', 'P17', 'P21', 'P28', 'P38'], out_path=None):
-    """
-    Iterate over timepoints and replicates, merge per-age and then all ages.
-    """
-    base_path = Path(__file__).parent.parent / 'ProcessedData'
-    default_suffs: List[str] = ['_nr_1_a', '_nr_1_b', '_nr_2_a', '_nr_2_b']
-    special_suffs: Dict[str, List[str]] = {'P38': ['_nr_1_a', '_nr_2_a', '_nr_2_b']}
-
-    age_adatas: List[AnnData] = []
-    for age in timepoints:
-        suffixes = special_suffs.get(age, default_suffs)
-        reps = []
-
-        for s in suffixes:
-            rep = process_replicate(base_path / "Raw_Counts_samples" / f"{age}{s}" / "filtered_feature_bc_matrix")
-
-            # FIX 4: ADD THIS BLOCK - Ensure unique cell names by prefixing
-            replicate_id = s.split('_nr_')[1].replace('_', '')
-            rep.obs_names = [f"{age}_{replicate_id}_{bc}" for bc in rep.obs_names]
-
-            reps.append(rep)
-
-        batch_labels = [f"{age}_{s.split('_nr_')[1].replace('_', '')}" for s in suffixes]
-        age_adatas.append(
-            anndata.concat(reps, label='batch', keys=batch_labels)
-        )
-    adata = anndata.concat(age_adatas, label='batch', keys=timepoints)
-    adata.write_h5ad(out_path or 'PooledMVC_dubs.h5ad')
-    return
-
-def annotate_doublets(
-    clustered_path: Path,
-    dubs_path: Path,
-    output_path: Path = Path('PooledMVC_clusteredPCA_dubs.h5ad')
+def plot_age_class_distributions_scarf(
+		ds: scarf.DataStore,
+		output_dir: Path
 ) -> None:
-    """
-    Load a clustered AnnData from `clustered_path`, pull in doublet
-    labels/scores from `dubs_path`, create UMAP plots, and write out
-    the merged object to `output_path`.
-    """
-    # load objects
-    adata = sc.read_h5ad(clustered_path)
-    adata.obs_names_make_unique()            # ensure unique barcodes
-
-    dubs = sc.read_h5ad(dubs_path)
-    dubs.obs_names_make_unique()             # ensure unique barcodes
-
-    # DEBUG: Print barcode info
-    print(f"Clustered data: {adata.n_obs} cells")
-    print(f"Doublets data: {dubs.n_obs} cells")
-    print(f"Sample clustered barcodes: {list(adata.obs_names[:5])}")
-    print(f"Sample doublet barcodes: {list(dubs.obs_names[:5])}")
-
-    # intersect cell barcodes and subset
-    common = adata.obs_names.intersection(dubs.obs_names)
-    print(f"Common cells found: {len(common)}")
-    if len(common) == 0:
-        raise ValueError("No common cells found between clustered and doublets data!")
-
-    adata = adata[common].copy()
-
-    # add doublet annotations
-    adata.obs['Doublet'] = dubs.obs.loc[common, 'Doublet']
-    adata.obs['Doublet Score'] = dubs.obs.loc[common, 'Doublet Score']
-
-    # generate UMAPs
-    sc.pl.umap(
-        adata,
-        color=['Doublet', 'leiden', 'Doublet Score'],
-        legend_loc='on data',
-        legend_fontsize='6',
-        save='_DoubletView.pdf'
-    )
-
-    # write merged AnnData
-    adata.write_h5ad(output_path)
-
-def plot_doublet_score_distribution(
-    input_h5ad: Path,
-    output_score_pdf: Path = Path('figures/DoubletScores.pdf'),
-    output_percent_pdf: Path = Path('figures/DoubletPercents.pdf')
-) -> None:
-    """
-    Load clustered AnnData, compute per-cluster doublet score means ± SD
-    and percent doublets, then plot and save bar charts.
-    """
-    import matplotlib.pyplot as plt
-
-    adata = sc.read_h5ad(input_h5ad)
-    # make cluster column from leiden so dendrogram can use it
-    adata.obs['cluster'] = adata.obs['leiden']
-
-    sc.tl.dendrogram(adata, groupby='cluster', key_added='dendrogram_cluster')
-    clusters = adata.uns["dendrogram_cluster"]['dendrogram_info']['ivl']
-
-    means, sds, perc = [], [], []
-    for cl in clusters:
-        sub = adata[adata.obs.cluster == cl]
-        ds = sub.obs['Doublet Score']
-        means.append(ds.mean())
-        sds.append(ds.std())
-        perc.append(sub.obs['Doublet'].sum() * 100 / sub.n_obs)
-
-    # Doublet Score plot
-    fig, ax = plt.subplots(figsize=(24, 9))
-    ax.bar(clusters, means, yerr=sds, align='center',
-           alpha=0.5, ecolor='black', capsize=5, color='blue')
-    ax.set_xticklabels(clusters, rotation=45)
-    ax.set_ylabel('Doublet Score')
-    plt.tight_layout()
-    plt.savefig(output_score_pdf)
-
-    # Doublet Percentage plot
-    fig, ax = plt.subplots(figsize=(24, 9))
-    ax.bar(clusters, perc, color='blue', width=0.75)
-    ax.set_xticklabels(clusters, rotation=90)
-    ax.set_ylabel('Doublet Percentage')
-    plt.tight_layout()
-    plt.savefig(output_percent_pdf)
-
-
-def annotate_clusters_and_plot(
-        input_path: Path,
-        output_path: Path,
-        cluster_map: Dict[int, str],  # This is cluster_dict from definitions.py {int_leiden_id: named_cluster}
-        class_broad_map: Dict[str, str],  # This MUST BE {str_leiden_id: broad_class_name} from updated definitions.py
-        leiden_markers: List[str]
-) -> None:
-    """
-    Load clustered AnnData, rename Leiden clusters to named clusters (in 'cluster' column),
-    assign broad cell classes (in 'Class_broad' column) based on Leiden IDs,
-    write out, then plot UMAPs (Class_broad, leiden, cluster, batch, Doublet) and a dotplot.
-    """
-    from matplotlib.colors import ListedColormap
-    import seaborn as sns
-
-    adata = sc.read_h5ad(input_path)
-    adata = adata[adata.obs['leiden'] != '42', :]  # Filter out cluster '42'
-
-    # 1. Rename Leiden clusters to named clusters for adata.obs['cluster']
-    adata.obs['cluster'] = adata.obs['leiden']  # Create 'cluster' from 'leiden'
-    # Prepare map for renaming: cluster_map keys (int) to string to match leiden categories (str)
-    new_category_names_list = [cluster_map[int(cat)] for cat in adata.obs['leiden'].cat.categories]
-    adata.rename_categories(key='cluster', categories=new_category_names_list)
-
-    # Now adata.obs['cluster'] contains names like 'Exc_13', 'Astro_2'
-
-    # 2. Assign broad cell classes to adata.obs['Class_broad']
-    # Uses the original 'leiden' column (e.g., '0', '6') and the
-    # class_broad_map (which MUST be {str_leiden_id: broad_class_name} in definitions.py).
-    mapped_broad_classes = adata.obs['leiden'].astype(str).map(class_broad_map)
-    adata.obs['Class_broad'] = mapped_broad_classes.fillna('Excitatory').astype('category')
-    # Now adata.obs['Class_broad'] contains 'Astrocytes', 'Excitatory', etc.
-
-    # 3. (Recommended) Set category order for 'Class_broad' for consistent plotting
-    broad_class_order = [
-        'Astrocytes', 'Oligodendrocytes', 'OPCs', 'Microglia',
-        'Endothelial', 'VLMC', 'Inhibitory', 'Excitatory', 'Ambiguous'
-    ]
-    # Filter to only include classes actually present in the data
-    present_broad_classes = [c for c in broad_class_order if c in adata.obs['Class_broad'].cat.categories]
-    if present_broad_classes:  # Check if list is not empty
-        adata.obs['Class_broad'] = adata.obs['Class_broad'].cat.set_categories(present_broad_classes)
-
-    # 4. Save annotated AnnData
-    adata.write_h5ad(output_path)
-
-    # 5. UMAP Palettes (improved for dynamic number of categories)
-    num_actual_broad_classes = len(adata.obs['Class_broad'].cat.categories)
-    palette_cb_base = sns.color_palette('Set1', n_colors=max(1, num_actual_broad_classes))
-    if num_actual_broad_classes > len(palette_cb_base):
-        palette_cb = (sns.color_palette('Set1').as_hex() +
-                      sns.color_palette('Set2').as_hex() +
-                      sns.color_palette('Set3').as_hex())[:num_actual_broad_classes]
-    else:
-        palette_cb = palette_cb_base.as_hex()[:num_actual_broad_classes]
-
-    # Palette for Leiden clusters
-    num_leiden_cats = len(adata.obs['leiden'].cat.categories)
-    base_palettes_long = (sns.color_palette('pastel').as_hex() +
-                          sns.color_palette('Set2').as_hex() +
-                          sns.color_palette('Set3').as_hex() +
-                          sns.color_palette('hls').as_hex() +
-                          sns.color_palette('husl').as_hex())
-    leiden_cluster_cols = base_palettes_long[:num_leiden_cats]
-    if num_leiden_cats > len(leiden_cluster_cols):  # Repeat if not enough unique colors
-        leiden_cluster_cols = (base_palettes_long * (num_leiden_cats // len(base_palettes_long) + 1))[:num_leiden_cats]
-
-    # Palette for named clusters (adata.obs['cluster'])
-    num_named_clusters = len(adata.obs['cluster'].cat.categories)
-    named_cluster_cols = base_palettes_long[:num_named_clusters]
-    if num_named_clusters > len(named_cluster_cols):
-        named_cluster_cols = (base_palettes_long * (num_named_clusters // len(base_palettes_long) + 1))[
-                             :num_named_clusters]
-
-    # 6. UMAP plots
-    sc.pl.umap(adata, color=['Class_broad'], palette=palette_cb,
-               add_outline=True, save='_Classes_broad.pdf')  # This should now be correct
-
-    sc.pl.umap(adata, color='leiden', palette=leiden_cluster_cols,  # Original Leiden IDs
-               legend_loc='on data', legend_fontsize='6',
-               add_outline=True, save='_leiden.pdf')
-
-    sc.pl.umap(adata, color='cluster', palette=named_cluster_cols,  # Named clusters
-               legend_loc='on data', legend_fontsize='6',
-               add_outline=True, save='_cluster_named.pdf')
-
-    sc.pl.umap(adata, color='batch', legend_fontsize='10',  # 'batch' likely refers to age
-               add_outline=True, save='_age.pdf')
-
-    sc.pl.umap(adata, color='Doublet',
-               legend_loc='on data', legend_fontsize='6',
-               add_outline=True, save='_DoubletsColor.pdf')
-
-    # 7. Dotplot for main markers
-    # groupby='cluster' uses the named clusters (e.g., 'Exc_13', 'Astro_1'), which is good.
-    mapcol = ListedColormap(sns.color_palette('light:#a31fe7', n_colors=100).as_hex())
-    sc.pl.dotplot(adata, leiden_markers, groupby='cluster',
-                  dendrogram=True, dot_max=0.8, vmax=2,
-                  cmap=mapcol, save='Markers_cluster.pdf')
-
-
-def assign_subclasses(
-    input_h5ad: Path,
-    subclass_map: Dict[str, List[str]],
-    output_h5ad: Path
-) -> None:
-    """
-    Load AnnData, map clusters to subclasses based on subclass_map,
-    then write updated AnnData to output_h5ad.
-    """
-    import pandas as pd
-
-    adata = sc.read_h5ad(input_h5ad)
-    # invert subclass_map for fast lookup
-    cluster_to_sub = {
-        cluster: sub
-        for sub, clusters in subclass_map.items()
-        for cluster in clusters
-    }
-    adata.obs['Subclass'] = pd.Categorical(
-        adata.obs['cluster'].map(lambda cl: cluster_to_sub.get(cl, 'Unknown'))
-    )
-    adata.write_h5ad(output_h5ad)
-
-
-def plot_subclass_doublet_distribution(
-    input_h5ad: Path,
-    output_score_pdf: Path = Path('figures/Subclass_DoubletScores.pdf'),
-    output_percent_pdf: Path = Path('figures/Subclass_DoubletPercents.pdf')
-) -> None:
-    """
-    Load annotated AnnData with Subclass, compute per-subclass
-    doublet score means ± SD and percent doublets, then plot/bar charts.
-    """
-    import matplotlib.pyplot as plt
-
-    adata = sc.read_h5ad(input_h5ad)
-    sc.tl.dendrogram(adata, groupby='Subclass', key_added='dendrogram_Subclass')
-    subclasses = adata.uns["dendrogram_Subclass"]['dendrogram_info']['ivl']
-
-    means, sds, perc = [], [], []
-    for sub in subclasses:
-        subdata = adata[adata.obs['Subclass'] == sub]
-        ds = subdata.obs['Doublet Score']
-        means.append(ds.mean())
-        sds.append(ds.std())
-        perc.append(subdata.obs['Doublet'].sum() * 100 / subdata.n_obs)
-
-    # Doublet Score plot
-    fig, ax = plt.subplots(figsize=(24, 9))
-    ax.bar(subclasses, means, yerr=sds, align='center',
-           alpha=0.5, ecolor='black', capsize=5, color='blue', width=0.75)
-    ax.set_ylabel('Doublet Score')
-    ax.set_xticklabels(subclasses, rotation=45)
-    plt.tight_layout()
-    plt.savefig(output_score_pdf)
-
-    # Doublet Percentage plot
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.bar(subclasses, perc, color='blue', width=0.75)
-    ax.set_ylabel('Doublet Percentage')
-    ax.set_xticklabels(subclasses)
-    plt.tight_layout()
-    plt.savefig(output_percent_pdf)
-
-
-def plot_cluster_size_distribution(
-        input_h5ad: Path,
-        output_pdf: Path,
-        figsize: tuple
-) -> None:
-    import matplotlib.pyplot as plt
-
-    adata = sc.read_h5ad(input_h5ad)
-    counts = adata.obs.cluster.value_counts(normalize=True) * 100
-    order = list(adata.obs.cluster.cat.categories)
-
-    # fallback to leiden_colors if cluster_colors is missing
-    colors = adata.uns.get('cluster_colors', adata.uns.get('leiden_colors'))
-
-    fig, ax = plt.subplots(figsize=figsize)
-    ax.bar(order, counts.reindex(order, fill_value=0),
-           color=colors, edgecolor='black', linewidth=1)
-    ax.spines[['right','top','bottom']].set_visible(False)
-    ax.set_ylabel('Percentage of cells')
-    plt.xticks(rotation=90, fontsize=10)
-    plt.yticks(fontsize=12)
-    plt.savefig(output_pdf)
-    plt.close()
-
-def remove_doublets_and_ambiguous(
-        input_h5ad: Path,
-        output_h5ad: Path = Path('PooledMVC_clusteredPCA_dubs_classes_clean.h5ad'),
-        ambiguous_prefixes: List[str] = ['Ambig_'],
-        verbose: bool = True
-) -> AnnData:
-    """
-    Remove ambiguous clusters and doublet cells to create a cleaned dataset.
-
-    Args:
-        input_h5ad: Path to annotated AnnData with clusters and doublet annotations
-        output_h5ad: Path to write clean AnnData
-        ambiguous_prefixes: List of prefixes identifying ambiguous clusters
-        verbose: Whether to print object size before/after cleaning
-
-    Returns:
-        Cleaned AnnData object
-    """
-    adata = sc.read_h5ad(input_h5ad)
-
-    if verbose:
-        print('Object before removing doublets clusters')
-        print(adata)
-
-    # Filter out ambiguous clusters
-    mask = ~adata.obs['cluster'].str.startswith(tuple(ambiguous_prefixes))
-    adata = adata[mask]
-
-    # Remove doublet cells
-    adata = adata[adata.obs['Doublet'] == False]
-
-    if verbose:
-        print('Object after removing doublets clusters')
-        print(adata)
-        print(f"Number of cells remaining: {adata.shape[0]}")
-
-    adata.write_h5ad(output_h5ad)
-    return adata
-
-
-def plot_age_class_distributions(
-        input_h5ad: Path,
-        output_class_pdf: Path = Path('figures/age_fraction_class.pdf'),
-        output_age_pdf: Path = Path('figures/age_fraction_cluster.pdf'),
-        figsize_class: tuple = (20, 7),
-        figsize_age: tuple = (30, 8)
-) -> None:
-    """
-    Create stacked bar charts showing:
-    1. The distribution of broad cell classes within each age group (batch).
-    2. The distribution of age groups (batch) within each named cluster.
-
-    Pulls colors from adata.uns['Class_broad_colors'] and adata.uns['batch_colors'].
-    Orders clusters based on adata.uns["dendrogram_['cluster']"].
-    """
-    adata = sc.read_h5ad(input_h5ad)
-    obs = adata.obs
-
-    # --- Plot 1: Class distribution across Ages ---
-    # Define the desired order for broad classes (as in paste-2.txt)
-    # This order will also dictate the legend and stacking order.
-    class_order = ['Astrocytes', 'Oligodendrocytes', 'OPCs', 'Microglia',
-                   'Endothelial', 'VLMC', 'Inhibitory', 'Excitatory', 'Ambiguous']
-
-    # Ensure 'Class_broad' and 'batch' are categorical
-    if not pd.api.types.is_categorical_dtype(obs['Class_broad']):
-        obs['Class_broad'] = obs['Class_broad'].astype('category')
-    if not pd.api.types.is_categorical_dtype(obs['batch']):
-        obs['batch'] = obs['batch'].astype('category')
-
-    # Calculate proportion of each Class_broad for each batch (age)
-    ct1 = pd.crosstab(obs.batch, obs.Class_broad, normalize='index') * 100
-
-    # Reorder columns (Class_broad) to match class_order and fill missing with 0
-    # Also, only include classes present in the data to avoid issues with missing colors/categories
-    plot_class_order = [c for c in class_order if c in ct1.columns]
-    ct1 = ct1.reindex(columns=plot_class_order, fill_value=0)
-
-    fig, ax = plt.subplots(figsize=figsize_class)
-
-    # Prepare colors for Class_broad, ensuring alignment with plot_class_order
-    class_broad_plot_colors = []
-    if 'Class_broad_colors' in adata.uns and adata.obs['Class_broad'].cat.categories.any():
-        # Create a mapping from actual category name to its color
-        class_cat_list = adata.obs['Class_broad'].cat.categories.tolist()
-        color_map_dict = dict(zip(class_cat_list, adata.uns['Class_broad_colors']))
-        class_broad_plot_colors = [color_map_dict.get(cls, '#CCCCCC') for cls in
-                                   plot_class_order]  # Use gray for missing
-    else:
-        logger.warning(
-            "adata.uns['Class_broad_colors'] not found or 'Class_broad' has no categories. Using fallback palette.")
-        if len(plot_class_order) > 0:
-            class_broad_plot_colors = sns.color_palette('tab20', n_colors=len(plot_class_order)).as_hex()
-
-    # Plot using pandas' plot method with specified colors
-    if not ct1.empty and class_broad_plot_colors:
-        ct1.plot(kind='bar', stacked=True, ax=ax, width=0.5,
-                 edgecolor='white', color=class_broad_plot_colors)
-        ax.legend(title='Broad Class', ncol=max(1, len(plot_class_order) // 2), bbox_to_anchor=(0, 1.02),
-                  loc='lower left', fontsize='small')
-    else:
-        ax.text(0.5, 0.5, "No data to plot for class distribution by age.", ha='center', va='center')
-
-    ax.set_ylabel("Percentage of Cells per Age Group")
-    ax.set_xlabel("Age Group (Batch)")
-    plt.xticks(rotation=30, ha='right')
-    plt.tight_layout()
-    plt.savefig(output_class_pdf)
-    plt.close()
-
-    # --- Plot 2: Age distribution across Clusters ---
-    # Get cluster order from dendrogram
-    if "dendrogram_['cluster']" in adata.uns and 'ivl' in adata.uns["dendrogram_['cluster']"]['dendrogram_info']:
-        cluster_order = list(adata.uns["dendrogram_['cluster']"]['dendrogram_info']['ivl'])
-    else:
-        logger.warning("Dendrogram for 'cluster' not found or 'ivl' key missing. Using sorted cluster names.")
-        if pd.api.types.is_categorical_dtype(obs['cluster']):
-            cluster_order = sorted(list(obs.cluster.cat.categories))
-        else:  # Fallback if cluster is not categorical or missing
-            cluster_order = sorted(list(obs.cluster.unique()))
-
-    # Ensure 'cluster' is categorical for crosstab
-    if not pd.api.types.is_categorical_dtype(obs['cluster']):
-        obs['cluster'] = obs['cluster'].astype('category')
-
-    # Calculate proportion of each batch (age) for each cluster
-    ct2 = pd.crosstab(obs.cluster, obs.batch, normalize='index') * 100
-
-    # Define desired age order for columns (as in paste-2.txt)
-    age_order_plot = ['P8', 'P14', 'P17', 'P21', 'P28', 'P38']
-    # Filter age_order_plot to only include ages present in ct2.columns
-    actual_age_order_for_plot = [age for age in age_order_plot if age in ct2.columns]
-
-    # Reorder columns (batch/age) and rows (cluster)
-    ct2 = ct2.reindex(columns=actual_age_order_for_plot, fill_value=0)
-    ct2 = ct2.reindex(index=cluster_order, fill_value=0)  # Match cluster order from dendrogram
-
-    fig, ax = plt.subplots(figsize=figsize_age)
-
-    # Prepare colors for batch/age, ensuring alignment with actual_age_order_for_plot
-    batch_plot_colors = []
-    if 'batch_colors' in adata.uns and adata.obs['batch'].cat.categories.any():
-        batch_cat_list = adata.obs['batch'].cat.categories.tolist()
-        color_map_dict_batch = dict(zip(batch_cat_list, adata.uns['batch_colors']))
-        batch_plot_colors = [color_map_dict_batch.get(age, '#CCCCCC') for age in actual_age_order_for_plot]
-    else:
-        logger.warning("adata.uns['batch_colors'] not found or 'batch' has no categories. Using fallback palette.")
-        if len(actual_age_order_for_plot) > 0:
-            batch_plot_colors = sns.color_palette('viridis', n_colors=len(actual_age_order_for_plot)).as_hex()
-
-    if not ct2.empty and batch_plot_colors and len(batch_plot_colors) == len(ct2.columns):
-        bottom = pd.Series(0.0, index=ct2.index)  # Initialize bottom for stacking
-        for i, age_column_name in enumerate(ct2.columns):  # Iterate through ages in the order of ct2.columns
-            vals = ct2[age_column_name]
-            ax.bar(ct2.index, vals, bottom=bottom, color=batch_plot_colors[i],
-                   edgecolor='white', width=0.5, label=age_column_name)
-            bottom += vals
-        ax.legend(title='Age Group', loc='best', fontsize='x-large')
-    else:
-        ax.text(0.5, 0.5, "No data to plot for age distribution by cluster.", ha='center', va='center')
-        if not batch_plot_colors or len(batch_plot_colors) != len(ct2.columns):
-            logger.error(f"Color mismatch: {len(batch_plot_colors)} colors for {len(ct2.columns)} age categories.")
-
-    ax.set_xticklabels(ct2.index, rotation=90, ha='right')  # Use ct2.index for tick labels
-    ax.set_ylabel("Percentage of Cells per Cluster")
-    ax.set_xlabel("Cluster")
-    plt.grid(axis='y', linestyle='--', alpha=0.7)  # Y-axis grid is often more useful for proportions
-    plt.tight_layout()
-    plt.savefig(output_age_pdf)
-    plt.close()
-
-
-def plot_sample_class_distribution(
-        input_h5ad: Path = Path('gluta_gaba_glia_combined_analyzed.h5ad'),
-        output_csv: Path = Path('data/samples_barplot.csv'),
-        output_pdf: Path = Path('figures/sample_dist_Fig1.pdf'),
-        figsize: tuple = (14, 6),
-        class_categories: List[str] = ['Excitatory', 'Inhibitory', 'Non-neuron']
-) -> None:
-    """
-    Create a stacked bar chart showing cell type proportions across samples.
-
-    Args:
-        input_h5ad: Path to analyzed h5ad file containing 'sample' and 'Class' annotations
-        output_csv: Path to save the proportion data as CSV
-        output_pdf: Path to save the stacked bar chart
-        figsize: Figure dimensions in inches
-        class_categories: List of cell class names to plot (in stacking order)
-    """
-    import pandas as pd
-    import matplotlib.pyplot as plt
-
-    adata = sc.read_h5ad(input_h5ad)
-
-    # Calculate proportions by sample
-    proportions = {}
-    for sample_name in adata.obs['sample'].values.categories:
-        sample_subset = adata[adata.obs['sample'] == sample_name]
-        counts = sample_subset.obs.Class.value_counts(normalize=True)
-        proportions[sample_name] = [
-            counts.get(class_name, 0) for class_name in class_categories
-        ]
-
-    # Create and save DataFrame
-    proportion_df = pd.DataFrame(
-        proportions,
-        index=class_categories
-    ).transpose()
-
-    proportion_df.to_csv(output_csv)
-
-    # Plot stacked bars
-    proportion_df.plot(
-        kind='bar',
-        stacked=True,
-        mark_right=True,
-        grid=False,
-        linewidth=0.5,
-        width=0.9,
-        figsize=figsize
-    )
-
-    plt.legend(bbox_to_anchor=(0.99, 1), loc='upper left', fontsize=14, ncol=1)
-    plt.ylabel('Proportion of Sample', fontsize=16)
-    plt.xlabel('Sample', rotation='180', fontsize=16)
-    plt.yticks([0, 0.25, 0.50, 0.75, 1.00], rotation='90')
-    plt.xticks(rotation='90')
-    plt.tight_layout()
-    plt.savefig(output_pdf, dpi=200)
-    plt.close()
-
-
-def plot_age_distribution_by_cluster_reversed(
-        input_h5ad: Path,
-        output_pdf: Path = Path('figures/age_fraction_reversed.pdf'),
-        figsize: tuple = (30, 8),
-        barwidth: float = 0.5
-) -> None:
-    """
-    Create a stacked bar chart showing age distribution across clusters
-    with P8 at the top of the stack and P38 at the bottom.
-
-    Args:
-        input_h5ad: Path to annotated AnnData with clusters and age information
-        output_pdf: Path to save the age distribution chart
-        figsize: Figure dimensions for the chart
-        barwidth: Width of the bars in the chart
-    """
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import pandas as pd
-
-    adata = sc.read_h5ad(input_h5ad)
-
-    # Ensure 'cluster' is used as groupby for dendrogram
-    sc.tl.dendrogram(adata, groupby='cluster', key_added='dendrogram_cluster')
-
-    # Get clusters in dendrogram order
-    clusters = list(adata.uns['dendrogram_cluster']['dendrogram_info']['ivl'])
-
-    # Get actual ages present in the data
-    available_ages = adata.obs.batch.cat.categories.tolist()
-
-    # Use standard age order but only include ages present in the data
-    expected_ages = ['P8', 'P14', 'P17', 'P21', 'P28', 'P38']
-    ages = [age for age in expected_ages if age in available_ages]
-
-    if not ages:  # Fallback if no expected ages match
-        ages = available_ages
-
-    # Create a cross-tabulation to count cells per cluster and age
-    cross_tab = pd.crosstab(
-        adata.obs['cluster'],
-        adata.obs['batch']
-    )
-
-    # Ensure we only use ages that exist in the data
-    cross_tab = cross_tab.reindex(columns=ages, fill_value=0)
-
-    # Reorder rows according to dendrogram
-    cross_tab = cross_tab.reindex(index=clusters)
-
-    # Calculate proportion per cluster (normalize rows)
-    proportion_tab = cross_tab.div(cross_tab.sum(axis=1), axis=0) * 100
-
-    # Get colors from AnnData or use a fallback palette
-    if 'batch_colors' in adata.uns and len(adata.uns['batch_colors']) >= len(available_ages):
-        color_map = dict(zip(available_ages, adata.uns['batch_colors']))
-        colors = [color_map.get(age, '#CCCCCC') for age in ages]
-    else:
-        # Fallback to viridis palette
-        colors = sns.color_palette('viridis', n_colors=len(ages))
-
-    # Create stacked bar chart
-    plt.figure(figsize=figsize)
-    r = range(len(clusters))
-
-    # Define stacking order and plot from bottom (P38) to top (P8)
-    reverse_ages = list(reversed(ages))
-
-    bottom = np.zeros(len(clusters))
-    for i, age in enumerate(reverse_ages):
-        age_idx = ages.index(age)  # Get original index for color mapping
-
-        plt.bar(r, proportion_tab[age],
-                bottom=bottom,
-                color=colors[age_idx],
-                edgecolor='white',
-                width=barwidth,
-                label=age)
-
-        # Update bottom for next bar
-        bottom += proportion_tab[age]
-
-    plt.legend(loc='best', fontsize='x-large')
-    plt.xticks(r, clusters, rotation=90)
-    plt.ylabel("Percentage of Cells per Cluster")
-    plt.grid(axis='y')
-    plt.tight_layout()
-    plt.savefig(output_pdf)
-    plt.close()
-
-def split_by_class_and_age(
-        input_h5ad: Path = Path('PooledMVC_clusteredPCA_dubs_classes_clean.h5ad'),
-        output_dir: Path = Path('data/split_objects'),
-        neuron_classes: List[str] = ['Excitatory', 'Inhibitory'],
-        verbose: bool = True
+	"""Create age/class distribution plots using Scarf data"""
+
+	# Extract metadata as DataFrame
+	obs_df = pd.DataFrame({
+		'batch': ds.cells.fetch('batch'),
+		'Class_broad': ds.cells.fetch('Class_broad'),
+		'cluster': ds.cells.fetch('cluster')
+	})
+
+	# Plot 1: Class distribution across ages
+	class_order = ['Astrocytes', 'Oligodendrocytes', 'OPCs', 'Microglia',
+				   'Endothelial', 'VLMC', 'Inhibitory', 'Excitatory', 'Ambiguous']
+
+	ct1 = pd.crosstab(obs_df.batch, obs_df.Class_broad, normalize='index') * 100
+	plot_class_order = [c for c in class_order if c in ct1.columns]
+	ct1 = ct1.reindex(columns=plot_class_order, fill_value=0)
+
+	fig, ax = plt.subplots(figsize=(20, 7))
+	colors = sns.color_palette('Set1', n_colors=len(plot_class_order))
+	ct1.plot(kind='bar', stacked=True, ax=ax, width=0.5, color=colors)
+	ax.set_ylabel("Percentage of Cells per Age Group")
+	ax.set_xlabel("Age Group (Batch)")
+	plt.xticks(rotation=30, ha='right')
+	plt.tight_layout()
+	plt.savefig(output_dir / 'age_fraction_class.pdf')
+	plt.close()
+
+	# Plot 2: Age distribution across clusters
+	ct2 = pd.crosstab(obs_df.cluster, obs_df.batch, normalize='index') * 100
+
+	fig, ax = plt.subplots(figsize=(30, 8))
+	age_colors = sns.color_palette('viridis', n_colors=len(ct2.columns))
+	ct2.plot(kind='bar', stacked=True, ax=ax, width=0.5, color=age_colors)
+	ax.set_ylabel("Percentage of Cells per Cluster")
+	ax.set_xlabel("Cluster")
+	plt.xticks(rotation=90, ha='right')
+	plt.tight_layout()
+	plt.savefig(output_dir / 'age_fraction_cluster.pdf')
+	plt.close()
+
+
+def split_by_class_and_age_scarf(
+		ds: scarf.DataStore,
+		output_dir: Path,
+		neuron_classes: List[str] = ['Excitatory', 'Inhibitory']
 ) -> Dict[str, Path]:
-    """
-    Split AnnData by cell class and age timepoints, saving class-specific objects
-    and age-specific objects for neuronal classes.
-    """
-    import os
+	"""Split Scarf DataStore by class and age, saving as AnnData for compatibility"""
 
-    # Create output directory if it doesn't exist
-    output_dir.mkdir(parents=True, exist_ok=True)
+	output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load the data
-    adata = sc.read_h5ad(input_h5ad)
+	# Get all metadata
+	obs_df = pd.DataFrame({
+		'batch': ds.cells.fetch('batch'),
+		'Class_broad': ds.cells.fetch('Class_broad'),
+		'cluster': ds.cells.fetch('cluster')
+	})
 
-    if verbose:
-        print(f"Loaded dataset with {adata.n_obs} cells")
+	saved_paths = {}
 
-    # Define the output paths
-    class_paths = {}
-    age_paths = {}
+	# Save class-specific objects
+	for class_name in neuron_classes + ['Non-neuron']:
+		if class_name == 'Non-neuron':
+			mask = ~obs_df['Class_broad'].isin(neuron_classes)
+		else:
+			mask = obs_df['Class_broad'] == class_name
 
-    # Split by major classes
-    class_objects = {}
+		if mask.sum() > 0:
+			# Get subset of cells
+			subset_indices = np.where(mask)[0]
 
-    # Create neuron class objects
-    for class_name in neuron_classes:
-        class_objects[class_name] = adata[adata.obs['Class_broad'] == class_name].copy()
-        class_paths[class_name] = output_dir / f"{class_name.lower()}.h5ad"
+			# Create subset DataStore
+			subset_path = output_dir / f'{class_name.lower()}_subset.zarr'
+			ds_subset = ds.get_cell_subset(subset_indices, zarr_loc=str(subset_path))
 
-    # Create non-neuronal object (cells that aren't in any neuron class)
-    non_mask = ~adata.obs['Class_broad'].isin(neuron_classes)
-    class_objects['Non-neuron'] = adata[non_mask].copy()
-    class_paths['Non-neuron'] = output_dir / "non_neuron.h5ad"
+			# Convert to AnnData for compatibility
+			adata_path = output_dir / f'{class_name.lower()}.h5ad'
+			convert_scarf_to_anndata(ds_subset, adata_path)
+			saved_paths[class_name] = adata_path
 
-    # Verify split was successful
-    total_cells = sum(obj.n_obs for obj in class_objects.values())
-    if total_cells == adata.n_obs and verbose:
-        print(f"Split successful: {total_cells} cells distributed across classes")
-    elif verbose:
-        print(f"Warning: Split resulted in {total_cells} cells vs {adata.n_obs} in original")
+	# Save age-specific objects for neuronal classes
+	ages = obs_df['batch'].unique()
 
-    # Save class objects
-    for class_name, obj in class_objects.items():
-        if verbose:
-            print(f"Saving {class_name} object with {obj.n_obs} cells")
-        obj.write_h5ad(class_paths[class_name])
+	for class_name in neuron_classes:
+		class_mask = obs_df['Class_broad'] == class_name
 
-    # Create age-specific objects for neuronal classes
-    # FIXED: Correctly access categorical categories
-    ages = list(adata.obs.batch.cat.categories)
+		for age in ages:
+			age_mask = obs_df['batch'] == age
+			combined_mask = class_mask & age_mask
 
-    for class_name in neuron_classes:
-        class_obj = class_objects[class_name]
+			if combined_mask.sum() > 0:
+				subset_indices = np.where(combined_mask)[0]
 
-        for age in ages:
-            # Extract cells for this class and age
-            age_obj = class_obj[class_obj.obs.batch == age].copy()
+				# Create age-specific subset
+				subset_path = output_dir / f'{class_name.lower()}_{age}_subset.zarr'
+				ds_subset = ds.get_cell_subset(subset_indices, zarr_loc=str(subset_path))
 
-            # Simplify object by removing unnecessary slots
-            for slot in ('obsp', 'varm', 'obsm', 'uns'):
-                if hasattr(age_obj, slot):
-                    setattr(age_obj, slot, {})
+				# Convert to AnnData
+				adata_path = output_dir / f'{class_name.lower()}_{age}.h5ad'
+				convert_scarf_to_anndata(ds_subset, adata_path)
+				saved_paths[f'{class_name}_{age}'] = adata_path
 
-            # Use raw counts
-            if hasattr(age_obj, 'raw') and age_obj.raw is not None:
-                age_obj.X = age_obj.raw.X.copy()
-
-            # Save age-specific object
-            age_path = output_dir / f"{class_name.lower()}_{age}.h5ad"
-            age_obj.write_h5ad(age_path)
-            age_paths[f"{class_name}_{age}"] = age_path
-
-            if verbose:
-                print(f"  Saved {age} {class_name} object with {age_obj.n_obs} cells")
-
-    # Return all paths
-    return {**class_paths, **age_paths}
+	return saved_paths
 
 
-def main(age=None):
-    # 1. Import and filter 10x for one timepoint
-    if age is None:
-        age = ['P8', 'P28']
-    age = [a1.upper() for a1 in age]
-    # create a single tag (e.g. "P8" or "P8_P14")
-    age_tag = '_'.join(age)
-    
-    # create data/<AGE> folder
-    data_dir = Path('data') / age_tag
-    data_dir.mkdir(parents=True, exist_ok=True)
-    fig_dir = Path('figures') / age_tag
-    fig_dir.mkdir(parents=True, exist_ok=True)                  # ensure figure dir exists
-    sc.settings.figdir = fig_dir                                # direct scanpy plots here
+def convert_scarf_to_anndata(ds: scarf.DataStore, output_path: Path) -> None:
+	"""Convert Scarf DataStore to AnnData for compatibility"""
+	from anndata import AnnData
+	import scipy.sparse as sp
 
-    print(f"Analyzing: {age_tag}")
-    pre_hvg_path = data_dir / f'PooledMVC_preHVG_{age_tag}.h5ad'
-    import_10x(age, pre_hvg_path)
+	# Get expression matrix (use raw counts)
+	X = ds.RNA.X
 
-    # 2. Cluster and save to `PooledMVC_clusteredPCA.h5ad`
-    clustered_path = data_dir / f'PooledMVC_clusteredPCA_{age_tag}.h5ad'
-    cluster(
-        path_to_pooled_pre_HVG=pre_hvg_path,
-        output_path=clustered_path
-    )
+	# Get cell and feature names
+	cell_names = ds.cells.fetch_all('names')
+	feature_names = ds.RNA.feats.fetch_all('names')
 
-    # 3. Post-clustering analysis and dotplots
-    post_clustering_analysis(
-        input_h5ad=pre_hvg_path,
-        output_h5ad=clustered_path
-    )
+	# Get metadata
+	obs_data = {}
+	for col in ds.cells.columns:
+		if col != 'names':  # Skip the names column
+			obs_data[col] = ds.cells.fetch(col)
 
-    # 4. Doublet detection and annotation
-    dubs_path = data_dir / f'PooledMVC_dubs_{age_tag}.h5ad'
-    doublet_detection(age, dubs_path)
-    dubs_clustered_path = data_dir / f'PooledMVC_clusteredPCA_dubs_{age_tag}.h5ad'
-    annotate_doublets(
-        clustered_path=clustered_path,
-        dubs_path=dubs_path,
-        output_path=dubs_clustered_path
-    )
+	obs_df = pd.DataFrame(obs_data, index=cell_names)
+	var_df = pd.DataFrame(index=feature_names)
 
-    # 5. Plot doublet score distribution on the merged AnnData
-    plot_doublet_score_distribution(
-        input_h5ad=dubs_clustered_path,
-        output_score_pdf=fig_dir / f'DoubletScores_{age_tag}.pdf',     # save under fig_dir
-        output_percent_pdf=fig_dir / f'DoubletPercents_{age_tag}.pdf'
-    )
+	# Create AnnData
+	adata = AnnData(X=X, obs=obs_df, var=var_df)
 
-    # 6. Rename clusters, assign broad classes, UMAPs & dotplot
-    acp_out = data_dir / f'PooledMVC_clusteredPCA_dubs_classes_{age_tag}.h5ad'
-    annotate_clusters_and_plot(
-        input_path=dubs_clustered_path,
-        output_path=acp_out,
-        cluster_map=cluster_dict,
-        class_broad_map=class_broad_map,
-        leiden_markers=leiden_markers
-    )
+	# Add UMAP if available
+	if 'RNA_UMAP_1' in ds.cells.columns:
+		adata.obsm['X_umap'] = np.column_stack([
+			ds.cells.fetch('RNA_UMAP_1'),
+			ds.cells.fetch('RNA_UMAP_2')
+		])
 
-    # 7. Assign subclasses and plot their doublet distributions
-    assign_subclasses(
-        input_h5ad=acp_out,
-        subclass_map=subclass_map,
-        output_h5ad=acp_out
-    )
-    plot_subclass_doublet_distribution(
-        input_h5ad=acp_out
-    )
+	# Save
+	adata.write_h5ad(output_path)
+	logger.info(f"Converted Scarf DataStore to AnnData: {output_path}")
 
-    clean_out = data_dir / f'PooledMVC_clusteredPCA_dubs_classes_clean_{age_tag}.h5ad'
-    remove_doublets_and_ambiguous(
-        input_h5ad=acp_out,
-        output_h5ad=clean_out
-    )
 
-    plot_cluster_size_distribution(
-        input_h5ad=acp_out,
-        output_pdf=fig_dir / f'cluster_fraction_{age_tag}.pdf',         # replaced data_dir/figures
-        figsize=(20, 7)
-    )
-    plot_age_class_distributions(
-        input_h5ad=acp_out,
-        output_class_pdf=fig_dir / f'age_fraction_class_{age_tag}.pdf',
-        output_age_pdf=fig_dir / f'age_fraction_cluster_{age_tag}.pdf'
-    )
-    if 0:
-        plot_sample_class_distribution(
-            input_h5ad=Path('gluta_gaba_glia_combined_analyzed.h5ad'),
-            output_csv=Path('data/samples_barplot.csv'),
-            output_pdf=Path('figures/sample_dist_Fig1.pdf')
-        )
-    plot_age_distribution_by_cluster_reversed(
-        input_h5ad=acp_out,
-        output_pdf=fig_dir / f'age_fraction_by_cluster_{age_tag}.pdf'
-    )
+def main_scarf(age: List[str] = None, max_memory_gb: float = 16) -> None:
+	"""Main Scarf-based analysis pipeline"""
 
-    result_paths = split_by_class_and_age(
-        input_h5ad=clean_out,
-        output_dir=data_dir / 'split_objects'
-    )
+	if age is None:
+		age = ['P8', 'P28']
+
+	age = [a.upper() for a in age]
+	age_tag = '_'.join(age)
+
+	# Setup directories
+	data_dir = Path('data') / age_tag
+	fig_dir = Path('figures') / age_tag
+	data_dir.mkdir(parents=True, exist_ok=True)
+	fig_dir.mkdir(parents=True, exist_ok=True)
+
+	logger.info(f"Starting Scarf-based analysis for {age_tag}")
+	logger.info(f"Target memory usage: <{max_memory_gb}GB")
+
+	# Step 1: Import data using Scarf
+	zarr_path = data_dir / f'scarf_data_{age_tag}.zarr'
+	ds = import_10x_scarf(age, str(zarr_path))
+
+	# Step 2: Clustering pipeline
+	ds = cluster_scarf(ds)
+
+	# Step 3: Doublet detection
+	ds = doublet_detection_scarf(ds)
+
+	# Step 4: Annotate clusters
+	ds = annotate_clusters_scarf(ds, cluster_dict, class_broad_map)
+
+	# Step 5: Generate comprehensive plots
+	plot_comprehensive_analysis_scarf(ds, fig_dir, leiden_markers)
+	plot_age_class_distributions_scarf(ds, fig_dir)
+
+	# Step 6: Remove doublets and ambiguous cells
+	doublet_mask = ds.cells.fetch('is_doublet') if 'is_doublet' in ds.cells.columns else [False] * ds.cells.N
+	cluster_names = ds.cells.fetch('cluster')
+	ambiguous_mask = [name.startswith('Ambig_') for name in cluster_names]
+
+	# Create clean dataset
+	clean_mask = [not (d or a) for d, a in zip(doublet_mask, ambiguous_mask)]
+	clean_indices = np.where(clean_mask)[0]
+
+	if len(clean_indices) > 0:
+		clean_zarr_path = data_dir / f'scarf_clean_{age_tag}.zarr'
+		ds_clean = ds.get_cell_subset(clean_indices, zarr_loc=str(clean_zarr_path))
+
+		# Step 7: Split by class and age
+		split_paths = split_by_class_and_age_scarf(
+			ds_clean,
+			data_dir / 'split_objects'
+		)
+
+		logger.info(f"Analysis complete. Split objects saved:")
+		for name, path in split_paths.items():
+			logger.info(f"  {name}: {path}")
+
+	# Step 8: Save final DataStore location
+	final_info_path = data_dir / 'scarf_analysis_info.txt'
+	with open(final_info_path, 'w') as f:
+		f.write(f"Scarf analysis complete for {age_tag}\n")
+		f.write(f"Main DataStore: {zarr_path}\n")
+		f.write(f"Clean DataStore: {clean_zarr_path}\n")
+		f.write(f"Figures: {fig_dir}\n")
+		f.write(f"Split objects: {data_dir / 'split_objects'}\n")
+
+	logger.info(f"Scarf-based analysis complete for {age_tag}")
+
 
 if __name__ == '__main__':
-    import sys
-    import fire
+	import sys
+	import fire
 
-    if len(sys.argv) == 1:
-        main()
-    else:
-        fire.Fire()
+	if len(sys.argv) == 1:
+		main_scarf()
+	else:
+		fire.Fire({
+			'main': main_scarf,
+			'import_only': import_10x_scarf,
+			'cluster_only': cluster_scarf
+		})
